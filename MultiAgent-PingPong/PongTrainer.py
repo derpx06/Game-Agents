@@ -1,80 +1,89 @@
 import pygame
-from pong_env import PongEnv
-from PongAgent import PongAgent
+import numpy as np
+from collections import deque
+
 
 class PongTrainer:
-    def __init__(self, env, agent1, agent2, max_episodes=10000, max_steps=1000, batch_size=1024):
+    def __init__(self, env, agent1, agent2, max_episodes=50000, max_steps=2000, batch_size=512):
         self.env = env
         self.agent1 = agent1
         self.agent2 = agent2
         self.max_episodes = max_episodes
         self.max_steps = max_steps
         self.batch_size = batch_size
-        self.best_score_diff = float('-inf')
+        self.best_avg_reward = float('-inf')
+        self.sequence_length = agent1.sequence_length
+        self.reward_history = deque(maxlen=100)
 
-    def run_episode(self, render=False):
-        state1, state2 = self.env.reset()
-        total_reward1 = total_reward2 = 0
-        steps = 0
+    def get_stacked_state(self, state_deque):
+        return np.array(list(state_deque))
+
+    def run_episode(self, training=True):
+        state1_single, state2_single = self.env.reset()
+
+        state1_hist = deque([state1_single] * self.sequence_length, maxlen=self.sequence_length)
+        state2_hist = deque([state2_single] * self.sequence_length, maxlen=self.sequence_length)
+
+        total_reward1, total_reward2, steps = 0, 0, 0
         done = False
 
         while not done and steps < self.max_steps:
-            if render:
+            if not training:
                 for event in pygame.event.get():
-                    if event.type == pygame.QUIT:
-                        self.env.close()
-                        raise SystemExit
+                    if event.type == pygame.QUIT: self.env.close(); raise SystemExit
 
-            # agents choose actions
-            action1 = self.agent1.choose_action(state1)
-            action2 = self.agent2.choose_action(state2)
+            stacked_state1 = self.get_stacked_state(state1_hist)
+            stacked_state2 = self.get_stacked_state(state2_hist)
 
-            # environment step
-            next_state1, next_state2, reward1, reward2, done, info = self.env.step(action1, action2)
+            action1 = self.agent1.choose_action(stacked_state1)
+            action2 = self.agent2.choose_action(stacked_state2)
 
-            # store experiences
-            self.agent1.store_experience(state1, action1, reward1, next_state1, done)
-            self.agent2.store_experience(state2, action2, reward2, next_state2, done)
+            next_state1_single, next_state2_single, reward1, reward2, done, info = self.env.step(action1, action2)
 
-            # train agents
-            if steps % 2 == 0:
-                self.agent1.train(self.batch_size)
-                self.agent2.train(self.batch_size)
+            state1_hist.append(next_state1_single)
+            state2_hist.append(next_state2_single)
 
-            # update states and rewards
-            state1, state2 = next_state1, next_state2
+            next_stacked_state1 = self.get_stacked_state(state1_hist)
+            next_stacked_state2 = self.get_stacked_state(state2_hist)
+
+            if training:
+                self.agent1.store_experience(stacked_state1, action1, reward1, next_stacked_state1, done)
+                self.agent2.store_experience(stacked_state2, action2, reward2, next_stacked_state2, done)
+                if steps > self.batch_size and steps % 4 == 0:
+                    self.agent1.train(self.batch_size)
+                    self.agent2.train(self.batch_size)
+                self.agent1.update_epsilon()
+                self.agent2.update_epsilon()
+
             total_reward1 += reward1
             total_reward2 += reward2
             steps += 1
 
-            if render:
-                self.env.render()
+            if not training: self.env.render()
 
-        # epsilon decay
-        self.agent1.update_epsilon()
-        self.agent2.update_epsilon()
-
-        # save best model
-        score_diff = info['score1'] - info['score2']
-        if score_diff > self.best_score_diff:
-            self.best_score_diff = score_diff
-            self.agent1.save_model('best_agent1.pth')
-            self.agent2.save_model('best_agent2.pth')
-
-        return info['score1'], info['score2'], total_reward1, total_reward2, info['rally_count'], info['ball_speed']
+        return info['score1'], info['score2'], total_reward1, total_reward2, info['rally_count'], info['games_played']
 
     def train(self):
         for episode in range(self.max_episodes):
-            score1, score2, reward1, reward2, rally_count, ball_speed = self.run_episode(render=True)
-            if episode % 100 == 0:
-                print(f"Episode {episode}, Score: {score1}-{score2}, "
-                      f"Rewards: {reward1:.1f}, {reward2:.1f}, "
-                      f"Rally Count: {rally_count}, Ball Speed: {ball_speed:.1f}")
+            score1, score2, r1, r2, rally, games = self.run_episode(training=True)
+
+            self.reward_history.append(r1 - r2)  # Track reward difference
+            avg_reward_diff = np.mean(self.reward_history)
+
+            if episode % 20 == 0:
+                print(
+                    f"Ep {episode:<5} | Games: {games:<3} | Score: {score1}-{score2} | Avg Reward Diff: {avg_reward_diff:<8.2f} | "
+                    f"Rally: {rally:<3} | Epsilon: {self.agent1.epsilon:.3f}")
+
+            if avg_reward_diff > self.best_avg_reward and len(self.reward_history) >= 100:
+                self.best_avg_reward = avg_reward_diff
+                print(f"*** New best avg reward diff: {avg_reward_diff:.2f}! Saving models... ***")
+                self.agent1.save_model('sota_agent1.pth')
+                self.agent2.save_model('sota_agent2.pth')
 
     def test(self):
-        print("Testing trained agents...")
-        score1, score2, reward1, reward2, rally_count, ball_speed = self.run_episode(render=True)
-        print(f"Test Episode, Score: {score1}-{score2}, "
-              f"Rewards: {reward1:.1f}, {reward2:.1f}, "
-              f"Rally Count: {rally_count}, Ball Speed: {ball_speed:.1f}")
-
+        print("\n--- Testing Trained SOTA Agents ---")
+        self.agent1.epsilon = 0
+        self.agent2.epsilon = 0
+        score1, score2, r1, r2, rally, games = self.run_episode(training=False)
+        print(f"Final Test Game -> Score: {score1}-{score2}")
