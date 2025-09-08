@@ -9,3 +9,8 @@ dependencies = [
     "pygame>=2.6.1",
     "torch>=2.8.0",
 ]
+
+[tool.uv.workspace]
+members = [
+    "MultiAgent-PingPong",
+]
