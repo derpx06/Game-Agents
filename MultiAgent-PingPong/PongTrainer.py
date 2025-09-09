@@ -4,86 +4,86 @@ from collections import deque
 
 
 class PongTrainer:
-    def __init__(self, env, agent1, agent2, max_episodes=50000, max_steps=2000, batch_size=512):
+    def __init__(self, env, agent1, agent2, batch_size=512):
         self.env = env
         self.agent1 = agent1
         self.agent2 = agent2
-        self.max_episodes = max_episodes
-        self.max_steps = max_steps
         self.batch_size = batch_size
-        self.best_avg_reward = float('-inf')
-        self.sequence_length = agent1.sequence_length
-        self.reward_history = deque(maxlen=100)
+        self.best_avg_reward = -np.inf
+        self.reward_history_for_saving = deque(maxlen=100)
+        self.clock = pygame.time.Clock()
 
-    def get_stacked_state(self, state_deque):
-        return np.array(list(state_deque))
+    def get_human_action(self):
+        """Checks keyboard state for human player input."""
+        keys = pygame.key.get_pressed()
+        if keys[pygame.K_UP]:
+            return 0
+        elif keys[pygame.K_DOWN]:
+            return 1
+        return 2
 
-    def run_episode(self, training=True):
-        state1_single, state2_single = self.env.reset()
-
-        state1_hist = deque([state1_single] * self.sequence_length, maxlen=self.sequence_length)
-        state2_hist = deque([state2_single] * self.sequence_length, maxlen=self.sequence_length)
-
-        total_reward1, total_reward2, steps = 0, 0, 0
+    def run_episode(self, training, render, interactive_player, game_speed):
+        """Runs a single episode of the game with the specified configuration."""
+        state1, state2 = self.env.reset()
+        total_r1, total_r2 = 0, 0
+        episode_stats = {'max_rally': 0, 'perfect_hits': 0, 'normal_hits': 0}
         done = False
 
-        while not done and steps < self.max_steps:
-            if not training:
-                for event in pygame.event.get():
-                    if event.type == pygame.QUIT: self.env.close(); raise SystemExit
+        while not done:
+            # --- FIX: Event loop now runs ALWAYS to keep the window responsive ---
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT: self.env.close(); raise SystemExit
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    print("Returning to main menu...")
+                    return None  # Signal an exit
 
-            stacked_state1 = self.get_stacked_state(state1_hist)
-            stacked_state2 = self.get_stacked_state(state2_hist)
+            action1 = self.agent1.choose_action(state1) if interactive_player != 'player1' else self.get_human_action()
+            action2 = self.agent2.choose_action(state2) if interactive_player != 'player2' else self.get_human_action()
 
-            action1 = self.agent1.choose_action(stacked_state1)
-            action2 = self.agent2.choose_action(stacked_state2)
+            # Pass the render flag to the env to control frame skipping visuals
+            next_state1, next_state2, r1, r2, done, info = self.env.step(action1, action2, render)
 
-            next_state1_single, next_state2_single, reward1, reward2, done, info = self.env.step(action1, action2)
-
-            state1_hist.append(next_state1_single)
-            state2_hist.append(next_state2_single)
-
-            next_stacked_state1 = self.get_stacked_state(state1_hist)
-            next_stacked_state2 = self.get_stacked_state(state2_hist)
+            episode_stats['max_rally'] = max(episode_stats['max_rally'], info['rally_count'])
+            episode_stats['perfect_hits'] += info['perfect_hit_p1'] + info['perfect_hit_p2']
+            episode_stats['normal_hits'] += info['normal_hit_p1'] + info['normal_hit_p2']
 
             if training:
-                self.agent1.store_experience(stacked_state1, action1, reward1, next_stacked_state1, done)
-                self.agent2.store_experience(stacked_state2, action2, reward2, next_stacked_state2, done)
-                if steps > self.batch_size and steps % 4 == 0:
-                    self.agent1.train(self.batch_size)
+                self.agent1.store_experience(state1, action1, r1, next_state1, done)
+                self.agent2.store_experience(state2, action2, r2, next_state2, done)
+                if len(self.agent1.replay_buffer) > self.batch_size * 10:
+                    self.agent1.train(self.batch_size);
                     self.agent2.train(self.batch_size)
-                self.agent1.update_epsilon()
-                self.agent2.update_epsilon()
 
-            total_reward1 += reward1
-            total_reward2 += reward2
-            steps += 1
+            state1, state2 = next_state1, next_state2
+            total_r1 += r1;
+            total_r2 += r2
 
-            if not training: self.env.render()
+            # Drawing is still conditional
+            if render:
+                self.clock.tick(game_speed)
 
-        return info['score1'], info['score2'], total_reward1, total_reward2, info['rally_count'], info['games_played']
+        if training:
+            self.agent1.update_epsilon();
+            self.agent2.update_epsilon()
 
-    def train(self):
-        for episode in range(self.max_episodes):
-            score1, score2, r1, r2, rally, games = self.run_episode(training=True)
+        episode_stats['reward_diff'] = total_r1 - total_r2
+        episode_stats['games_played'] = self.env.games_played
+        return episode_stats
 
-            self.reward_history.append(r1 - r2)  # Track reward difference
-            avg_reward_diff = np.mean(self.reward_history)
+    def check_for_save(self, current_avg_reward):
+        """Checks if the model should be saved and saves it."""
+        self.reward_history_for_saving.append(current_avg_reward)
+        avg_for_saving = np.mean(self.reward_history_for_saving)
+        if len(self.reward_history_for_saving) >= 100 and avg_for_saving > self.best_avg_reward:
+            self.best_avg_reward = avg_for_saving
+            self.agent1.save_model('agent1.pth');
+            self.agent2.save_model('agent2.pth')
+            return True
+        return False
 
-            if episode % 20 == 0:
-                print(
-                    f"Ep {episode:<5} | Games: {games:<3} | Score: {score1}-{score2} | Avg Reward Diff: {avg_reward_diff:<8.2f} | "
-                    f"Rally: {rally:<3} | Epsilon: {self.agent1.epsilon:.3f}")
-
-            if avg_reward_diff > self.best_avg_reward and len(self.reward_history) >= 100:
-                self.best_avg_reward = avg_reward_diff
-                print(f"*** New best avg reward diff: {avg_reward_diff:.2f}! Saving models... ***")
-                self.agent1.save_model('sota_agent1.pth')
-                self.agent2.save_model('sota_agent2.pth')
-
-    def test(self):
-        print("\n--- Testing Trained SOTA Agents ---")
-        self.agent1.epsilon = 0
-        self.agent2.epsilon = 0
-        score1, score2, r1, r2, rally, games = self.run_episode(training=False)
-        print(f"Final Test Game -> Score: {score1}-{score2}")
+    def run_loop(self, render, training, interactive_player, game_speed):
+        """Legacy loop for simple modes (Interactive, Spectator)."""
+        while True:
+            episode_stats = self.run_episode(training, render, interactive_player, game_speed)
+            if episode_stats is None:
+                return  # Exit if ESC was pressed
